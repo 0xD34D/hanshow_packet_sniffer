@@ -1,0 +1,3 @@
+[submodule "tc_platform_sdk"]
+	path = tc_platform_sdk
+	url = https://github.com/telink-semi/tc_platform_sdk.git
