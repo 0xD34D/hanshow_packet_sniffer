@@ -64,8 +64,21 @@ static void uart_init_sniffer(void) {
 #define RF_RX_BUF_SIZE 256
 static uint8_t rf_rx_buf[RF_RX_BUF_SIZE] __attribute__((aligned(4)));
 
-static const uint8_t acc_native_sync[5] = {0xF8, 0x3E, 0x0F, 0x83, 0xE0}; /* 5B native checkin */
+/* Two listen modes, toggled live with 'm':
+ *   MODE_TAG    - 5-byte native correlator, 180-byte 5x-repetition tag check-in frames.
+ *   MODE_BEACON - 4-byte store-beacon correlator, direct (non-5x) AP beacon frames. */
+typedef enum { MODE_TAG = 0, MODE_BEACON = 1 } sniff_mode_t;
 
+static const uint8_t acc_native_sync[5] = {0xF8, 0x3E, 0x0F, 0x83, 0xE0}; /* 5B native checkin */
+static const uint8_t acc_beacon_sync[4] = {0xB1, 0x36, 0x7C, 0xCA};       /* 4B AP store beacon */
+
+/* Max accepted length for a direct beacon frame (max-length filter in reg 0x406, NOT a fixed
+ * length — shorter frames still complete). Store beacons are 17B (0x11) or 20B (0x14), but this
+ * is a packet sniffer: keep generous headroom so anything on this sync word is captured, not
+ * filtered. The dma_len gate below is deliberately wide for the same reason. */
+#define BEACON_MAX_LEN 64
+
+static sniff_mode_t current_mode     = MODE_TAG; /* 'm' toggles; boot in tag mode (prior behavior) */
 static int16_t  current_500k_chn = 2; /* 2401.0 MHz */
 static uint32_t packet_count     = 0;
 static uint32_t last_rx_tick     = 0;
@@ -79,17 +92,27 @@ static void set_rx_hardware(void) {
     /* ShockBurst 500 kbps Mode 3 */
     write_reg8(0x404, (read_reg8(0x404) & ~0x07) | 0x03);
 
-    rf_acc_len_set(5);
-    write_reg8(0x405, 5);
-    write_reg8(0x420, 5 * 8);
-
-    /* Pipe 0: native 5-byte sync word */
-    for (uint8_t i = 0; i < 5; i++) {
-        write_reg8(0x408 + i, acc_native_sync[i]);
+    if (current_mode == MODE_TAG) {
+        /* 5-byte native sync word, fixed 180-byte 5x-repetition check-in frame */
+        rf_acc_len_set(5);
+        write_reg8(0x405, 5);
+        write_reg8(0x420, 5 * 8);
+        for (uint8_t i = 0; i < 5; i++) {
+            write_reg8(0x408 + i, acc_native_sync[i]);
+        }
+        write_reg8(0x407, 0x01); /* Enable Pipe 0 only */
+        write_reg8(0x406, 180);  /* 180-byte 5x-repetition check-in frame */
+    } else {
+        /* 4-byte store-beacon sync word, short direct (non-5x) beacon frame */
+        rf_acc_len_set(4);
+        write_reg8(0x405, 4);
+        write_reg8(0x420, 4 * 8);
+        for (uint8_t i = 0; i < 4; i++) {
+            write_reg8(0x408 + i, acc_beacon_sync[i]);
+        }
+        write_reg8(0x407, 0x01);           /* Enable Pipe 0 only */
+        write_reg8(0x406, BEACON_MAX_LEN);  /* max-length filter for the short beacon frame */
     }
-    write_reg8(0x407, 0x01); /* Enable Pipe 0 only */
-
-    write_reg8(0x406, 180); /* 180-byte 5x-repetition check-in frame */
 
     rf_rx_buf[0] = 0;
     rf_rx_buf[1] = 0;
@@ -132,14 +155,10 @@ static void decode_5x_repetition_range(const uint8_t *in_bytes, uint8_t *out_byt
 /* =========================================================================
  * Packet Processing & Diagnostic Logging
  * ========================================================================= */
-static void process_packet(uint32_t rx_tick) {
-    packet_count++;
-    led_green_on();
-
+static void process_tag_packet(uint32_t rx_tick) {
     uint32_t dma_len = rf_rx_buf[0] | (rf_rx_buf[1] << 8);
     if (dma_len < 180 || dma_len > 220) {
         /* Native 5B check-in frames are 180 bytes; anything else is noise on this sync word. */
-        led_green_off();
         return;
     }
 
@@ -256,7 +275,111 @@ static void process_packet(uint32_t rx_tick) {
         printf("%s", hexline);
     }
     printf("\n");
+}
 
+/* =========================================================================
+ * AP Store-Beacon Processing (direct, non-5x; 4-byte correlator B1 36 7C CA)
+ * ========================================================================= */
+static void process_beacon_packet(uint32_t rx_tick) {
+    uint32_t dma_len = rf_rx_buf[0] | (rf_rx_buf[1] << 8);
+    if (dma_len < 4 || dma_len > BEACON_MAX_LEN) {
+        /* Wide gate on purpose: reject only empty/overlong DMA artifacts, capture everything
+         * else on this sync word (both 17B/20B beacon variants and any other short frame). */
+        return;
+    }
+
+    /* Snapshot the DMA buffer so the radio can re-arm without colliding with the decode. */
+    static uint8_t pkt_copy[RF_RX_BUF_SIZE];
+    uint32_t copy_len = (dma_len + 6 > RF_RX_BUF_SIZE) ? RF_RX_BUF_SIZE : (dma_len + 6);
+    memcpy(pkt_copy, rf_rx_buf, copy_len);
+
+    /* Re-arm RX buffer immediately */
+    rf_rx_buf[0] = 0;
+    rf_rx_buf[1] = 0;
+    rf_rx_buffer_reconfig(rf_rx_buf);
+    rf_set_rxmode();
+
+    /* Direct frame: the DMA writes the actual length to pkt_copy[0..3], so the on-air
+     * payload begins at pkt_copy[4]. (Offset verified against the tag path's dma_len/RSSI
+     * handling; confirm on the first live beacon capture via the raw HEX line below.) */
+    const uint8_t *frame = &pkt_copy[4];
+
+    /* Byte 0 is the in-band frame length: 0x11 = 17B beacon, 0x14 = 20B beacon (count includes
+     * byte 0 through the trailing CRC). When it's a known beacon length we actually captured,
+     * trust it and show exactly that many bytes; otherwise fall back to the raw DMA length so
+     * unknown/other frames on this sync word are still shown in full. */
+    bool     known_beacon = (frame[0] == 0x11 || frame[0] == 0x14);
+    uint32_t frame_len    = (known_beacon && frame[0] <= dma_len) ? frame[0] : dma_len;
+
+    /* Turnaround / Delta T since previous captured frame */
+    uint32_t delta_ticks = rx_tick - last_rx_tick;
+    uint32_t delta_us    = delta_ticks / 16;
+    last_rx_tick         = rx_tick;
+
+    if (verbose_output) {
+        uint8_t raw_rssi   = pkt_copy[dma_len + 2];
+        int8_t  rssi_dbm   = (int8_t)raw_rssi - 110;
+        bool    hw_crc_ok  = RF_SB_PACKET_CRC_OK(pkt_copy);
+
+        printf("\n============================================================\n");
+        printf("📡 [BEACON] PKT #%d | ", (int)packet_count);
+        if (packet_count > 1) {
+            if (delta_us >= 1000) {
+                printf("Δt=%d.%03d ms | ", (int)(delta_us / 1000), (int)(delta_us % 1000));
+            } else {
+                printf("Δt=%d us | ", (int)delta_us);
+            }
+        }
+        printf("RSSI: %d dBm | CRC: %s\n", (int)rssi_dbm, hw_crc_ok ? "OK" : "CRC_FAIL");
+        printf("------------------------------------------------------------\n");
+
+        /* Documented store-beacon layout (CLAUDE.md): byte0=len (0x11/0x14), 1=PAN lo,
+         * 2=epoch/seq, 3=PAN hi, 4=channel, 5..6=schedule offset, 7=target slot,
+         * 9=flags (0x01=update scheduled), 10=cadence tier, 11..14=page bitmask. */
+        if (known_beacon) {
+            uint16_t pan_val   = frame[1] | (frame[3] << 8);
+            uint16_t sched_off = frame[5] | (frame[6] << 8);
+            printf("  🏪 [STORE BEACON] %s (%dB) | PAN: 0x%04X | Ch: %d | Seq: 0x%02X\n",
+                   (frame[0] == 0x11) ? "short" : "extended", frame[0],
+                   pan_val, frame[4], frame[2]);
+            printf("     Target Slot: %d | Flags: 0x%02X%s | Cadence: 0x%02X | Sched: %d\n",
+                   frame[7], frame[9], (frame[9] & 0x01) ? " (update scheduled)" : "",
+                   frame[10], sched_off);
+            printf("     Page Bitmask: %02X %02X %02X %02X\n",
+                   frame[11], frame[12], frame[13], frame[14]);
+        } else {
+            printf("  📦 [FRAME] Beacon sync, unexpected lead byte 0x%02X (Len %dB)\n",
+                   frame[0], (int)frame_len);
+        }
+    }
+
+    /* Raw Hex Dump of the direct beacon frame (printed in both modes) */
+    printf(verbose_output ? "     HEX: " : "HEX: ");
+    for (uint32_t i = 0; i < frame_len; i += 16) {
+        char hexline[16 * 3 + 1];
+        int n = 0;
+        for (uint32_t j = i; j < frame_len && j < i + 16; j++) {
+            hexline[n++] = "0123456789ABCDEF"[frame[j] >> 4];
+            hexline[n++] = "0123456789ABCDEF"[frame[j] & 0x0F];
+            hexline[n++] = ' ';
+        }
+        hexline[n] = '\0';
+        printf("%s", hexline);
+    }
+    printf("\n");
+}
+
+/* =========================================================================
+ * Packet Dispatcher — routes to the active listen mode
+ * ========================================================================= */
+static void process_packet(uint32_t rx_tick) {
+    packet_count++;
+    led_green_on();
+    if (current_mode == MODE_TAG) {
+        process_tag_packet(rx_tick);
+    } else {
+        process_beacon_packet(rx_tick);
+    }
     led_green_off();
 }
 
@@ -269,9 +392,13 @@ static void print_banner(void) {
     printf("  🛰️  HANSHOW NEBULAR DEDICATED GFSK RF PACKET SNIFFER\n");
     printf("  Channel  : 2 (2401.0 MHz, 500 kbps GFSK ShockBurst Mode 3)\n");
     printf("============================================================\n");
+    printf(" Mode       : %s\n",
+           current_mode == MODE_TAG
+               ? "TAG  (5B sync F8 3E 0F 83 E0, 180B 5x-repetition check-ins)"
+               : "BEACON (4B sync B1 36 7C CA, direct AP store beacons)");
     printf(" Verbose    : %s  ('v' toggles; off = raw HEX line per packet only)\n",
            verbose_output ? "ON" : "OFF");
-    printf(" Commands   : [v] Toggle Verbose  [c] Clear Stats  [?] Help\n");
+    printf(" Commands   : [m] Toggle Mode  [v] Toggle Verbose  [c] Clear Stats  [?] Help\n");
     printf("============================================================\n\n");
 }
 
@@ -290,6 +417,14 @@ static void poll_uart_rx(void) {
 
                 if (cmd == '?' || cmd == 'h') {
                     print_banner();
+                } else if (cmd == 'm') {
+                    current_mode = (current_mode == MODE_TAG) ? MODE_BEACON : MODE_TAG;
+                    set_rx_hardware();        /* re-arm radio with the new correlator/length */
+                    last_rx_tick = clock_time(); /* avoid a bogus Δt on the first new-mode packet */
+                    printf("[SNIFFER] Mode -> %s.\n",
+                           current_mode == MODE_TAG
+                               ? "TAG (F8 3E 0F 83 E0, 5x-repetition check-ins)"
+                               : "BEACON (B1 36 7C CA, direct AP store beacons)");
                 } else if (cmd == 'v') {
                     verbose_output = !verbose_output;
                     printf("[SNIFFER] Verbose output %s.\n", verbose_output ? "ON (full decode)" : "OFF (raw HEX only)");
